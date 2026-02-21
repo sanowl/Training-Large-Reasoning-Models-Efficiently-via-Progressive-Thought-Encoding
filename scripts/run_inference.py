@@ -69,6 +69,8 @@ def main() -> None:
         args.checkpoint,
         allow_partial=args.allow_partial_checkpoint,
     )
+    setup.model.eval()
+    setup.thought_encoder.eval()
     print(f"loaded checkpoint step={step}")
 
     cache = SlidingWindowCache(

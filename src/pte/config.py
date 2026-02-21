@@ -26,6 +26,8 @@ class ThoughtConfig:
     min_update_gate: float = 0.05
     max_update_gate: float = 0.30
     evidence_tokens_scale: float = 8.0
+    use_token_confidence_gate: bool = True
+    min_token_confidence: float = 0.05
     track_state_stats: bool = True
     state_stats_momentum: float = 0.01
     ood_guard_enabled: bool = True

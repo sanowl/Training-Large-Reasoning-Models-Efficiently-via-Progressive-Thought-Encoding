@@ -55,6 +55,7 @@ class ProgressiveThoughtTrainer:
 
         self.model.train().to(self.device)
         self.ref_model.eval().to(self.device)
+        self.thought_encoder.train().to(self.device)
         for param in self.ref_model.parameters():
             param.requires_grad = False
 

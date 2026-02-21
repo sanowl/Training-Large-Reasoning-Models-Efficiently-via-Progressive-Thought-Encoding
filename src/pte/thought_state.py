@@ -49,6 +49,10 @@ class ProgressiveThoughtEncoder(nn.Module):
             )
         if config.evidence_tokens_scale <= 0:
             raise ValueError(f"evidence_tokens_scale must be > 0, got {config.evidence_tokens_scale}")
+        if not 0.0 <= config.min_token_confidence <= 1.0:
+            raise ValueError(
+                f"min_token_confidence must be in [0, 1], got {config.min_token_confidence}"
+            )
 
         self.config = config
         self.rank = config.rank
@@ -165,6 +169,7 @@ class ProgressiveThoughtEncoder(nn.Module):
         s_new: torch.Tensor,
         *,
         evicted_tokens_per_layer: int | None = None,
+        evicted_token_confidence: torch.Tensor | None = None,
     ) -> torch.Tensor:
         state_n = F.normalize(state, p=2, dim=-1, eps=self.config.normalize_eps)
         s_new_n = F.normalize(s_new, p=2, dim=-1, eps=self.config.normalize_eps)
@@ -175,6 +180,16 @@ class ProgressiveThoughtEncoder(nn.Module):
         if evicted_tokens_per_layer is not None:
             evidence = min(1.0, float(evicted_tokens_per_layer) / float(self.config.evidence_tokens_scale))
             gate = gate * evidence
+        if self.config.use_token_confidence_gate and evicted_token_confidence is not None:
+            if evicted_token_confidence.ndim != 1 or evicted_token_confidence.shape[0] != state.shape[0]:
+                raise ValueError(
+                    f"evicted_token_confidence must be [B], got {tuple(evicted_token_confidence.shape)}"
+                )
+            conf = evicted_token_confidence.to(device=state.device, dtype=state.dtype).clamp(
+                min=self.config.min_token_confidence,
+                max=1.0,
+            )
+            gate = gate * conf
         return gate.unsqueeze(-1)  # [B, 1]
 
     def _update_state_stats(self, state: torch.Tensor) -> None:
@@ -219,6 +234,7 @@ class ProgressiveThoughtEncoder(nn.Module):
         *,
         detach_prev_state: bool = True,
         evicted_tokens_per_layer: int | None = None,
+        evicted_token_confidence: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if state.ndim != 2 or state.shape[1] != self.rank:
             raise ValueError(f"state must be [B, {self.rank}], got {tuple(state.shape)}")
@@ -232,6 +248,7 @@ class ProgressiveThoughtEncoder(nn.Module):
             base,
             s_new,
             evicted_tokens_per_layer=evicted_tokens_per_layer,
+            evicted_token_confidence=evicted_token_confidence,
         )
         base_scaled = (1.0 - self.config.state_decay) * base
         updated = base_scaled + gate * s_new

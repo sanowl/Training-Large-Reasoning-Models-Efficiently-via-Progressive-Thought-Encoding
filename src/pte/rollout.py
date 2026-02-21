@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -144,6 +145,7 @@ class CacheAwareRolloutEngine:
 
         num_eviction_events = 0
         num_evicted_tokens = 0
+        token_conf_queues = [deque() for _ in range(batch_size)]
 
         grad_ctx = nullcontext() if track_grad else torch.inference_mode()
         with grad_ctx:
@@ -162,6 +164,10 @@ class CacheAwareRolloutEngine:
                 generated_ids[:, step] = next_tokens
                 generated_mask[:, step] = valid_mask
                 sampled_logprobs[:, step] = token_logp.to(torch.float32) * valid_mask
+                token_prob = torch.exp(token_logp.detach()).clamp(min=0.0, max=1.0)
+                for batch_idx in range(batch_size):
+                    if bool(valid_mask[batch_idx].item()):
+                        token_conf_queues[batch_idx].append(float(token_prob[batch_idx].item()))
 
                 if self.eos_token_id is not None:
                     active = active & (next_tokens != self.eos_token_id)
@@ -179,12 +185,30 @@ class CacheAwareRolloutEngine:
                     window_size_override=window_override,
                 )
                 if evicted is not None and evicted.num_evicted > 0:
+                    evicted_conf_values: list[float] = []
+                    for batch_idx in range(batch_size):
+                        popped: list[float] = []
+                        for _ in range(evicted.num_evicted):
+                            if token_conf_queues[batch_idx]:
+                                popped.append(token_conf_queues[batch_idx].popleft())
+                            else:
+                                break
+                        if popped:
+                            evicted_conf_values.append(sum(popped) / float(len(popped)))
+                        else:
+                            evicted_conf_values.append(float(self.thought_encoder.config.min_token_confidence))
+                    evicted_token_conf = torch.tensor(
+                        evicted_conf_values,
+                        device=device,
+                        dtype=state.dtype,
+                    )
                     state = self.thought_encoder.update_state(
                         state,
                         evicted.keys.detach(),
                         evicted.values.detach(),
                         detach_prev_state=True,
                         evicted_tokens_per_layer=evicted.num_evicted,
+                        evicted_token_confidence=evicted_token_conf,
                     )
                     num_eviction_events += 1
                     num_evicted_tokens += evicted.num_evicted

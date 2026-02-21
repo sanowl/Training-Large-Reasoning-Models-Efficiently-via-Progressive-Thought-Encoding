@@ -106,6 +106,32 @@ class TestThoughtState(unittest.TestCase):
         ).item()
         self.assertGreater(gate_high, gate_low)
 
+    def test_update_gate_scales_with_token_confidence(self) -> None:
+        enc = ProgressiveThoughtEncoder(
+            ThoughtConfig(
+                hidden_size=8,
+                rank=4,
+                num_global_tokens=2,
+                min_update_gate=0.05,
+                max_update_gate=0.30,
+                use_token_confidence_gate=True,
+                min_token_confidence=0.05,
+            )
+        )
+        state = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+        candidate = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+        gate_low = enc._compute_update_gate(
+            state,
+            candidate,
+            evicted_token_confidence=torch.tensor([0.1]),
+        ).item()
+        gate_high = enc._compute_update_gate(
+            state,
+            candidate,
+            evicted_token_confidence=torch.tensor([0.9]),
+        ).item()
+        self.assertGreater(gate_high, gate_low)
+
     def test_layer_attention_accepts_layered_evicted_kv(self) -> None:
         enc = ProgressiveThoughtEncoder(
             ThoughtConfig(
@@ -132,7 +158,7 @@ class TestThoughtState(unittest.TestCase):
                 max_update_gate=0.3,
             )
         )
-        state = torch.tensor([[0.2, 0.0, 0.0, 0.0]])
+        state = torch.zeros(1, 4)
         # Stronger evidence should yield a larger state update magnitude.
         ev_k = torch.ones(1, 16, 8)
         ev_v = torch.ones(1, 16, 8)
@@ -272,6 +298,7 @@ class TestDynamicLoRA(unittest.TestCase):
         )
         with torch.no_grad():
             eye = torch.eye(2)
+            layer.lora_b.copy_(eye)
             layer.lora_a.copy_(eye)
 
         x = torch.tensor([[1.0, 1.0]])

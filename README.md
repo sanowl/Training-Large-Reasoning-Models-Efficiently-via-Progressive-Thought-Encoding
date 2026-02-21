@@ -158,6 +158,7 @@ If loading an older checkpoint without runtime metadata, add `--allow_partial_ch
 4. Rollout and reference-model passes support sub-batching to manage long-sequence memory pressure.
 5. Checkpoints unwrap DDP/compiled wrappers before serialization for load compatibility.
 6. Checkpoint runtime contract is validated by default (LoRA/thought config); `allow_partial` bypass is available.
+7. State updates are weighted by evicted-token confidence to reduce propagation of uncertain reasoning chunks.
 
 ## Limitations
 
