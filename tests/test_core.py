@@ -12,6 +12,7 @@ from pte.dynamic_lora import DynamicLoRAConfig, DynamicLoRALinear, dynamic_lora_
 from pte.grpo import grpo_objective, normalize_group_rewards
 from pte.hf_integration import load_pte_checkpoint
 from pte.rewards import answers_equivalent, extract_final_answer, math_equivalence_reward
+from pte.rollout import CacheAwareRolloutEngine
 from pte.thought_state import ProgressiveThoughtEncoder
 
 
@@ -309,6 +310,44 @@ class TestDynamicLoRA(unittest.TestCase):
         with thought.use_runtime_state(far_state):
             out_far = layer(x)
         self.assertGreater(float(out_near.norm().item()), float(out_far.norm().item()))
+
+
+class TestRolloutConfidenceBuffer(unittest.TestCase):
+    def test_append_token_confidences_vectorized(self) -> None:
+        conf_buffer = torch.zeros(3, 4, dtype=torch.float32)
+        conf_tail = torch.tensor([0, 0, 1], dtype=torch.long)
+        token_prob = torch.tensor([0.2, 0.3, 0.9], dtype=torch.float32)
+        active_mask = torch.tensor([True, False, True], dtype=torch.bool)
+
+        CacheAwareRolloutEngine._append_token_confidences(
+            conf_buffer=conf_buffer,
+            conf_tail=conf_tail,
+            token_prob=token_prob,
+            active_mask=active_mask,
+        )
+        self.assertTrue(torch.allclose(conf_tail, torch.tensor([1, 0, 2], dtype=torch.long)))
+        self.assertAlmostEqual(float(conf_buffer[0, 0].item()), 0.2, places=6)
+        self.assertAlmostEqual(float(conf_buffer[2, 1].item()), 0.9, places=6)
+
+    def test_pop_evicted_confidence_handles_partial_availability(self) -> None:
+        conf_buffer = torch.tensor(
+            [
+                [0.8, 0.6, 0.0],
+                [0.3, 0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+        conf_head = torch.tensor([0, 0], dtype=torch.long)
+        conf_tail = torch.tensor([2, 1], dtype=torch.long)
+        mean_conf = CacheAwareRolloutEngine._pop_evicted_confidence(
+            conf_buffer=conf_buffer,
+            conf_head=conf_head,
+            conf_tail=conf_tail,
+            num_evicted=2,
+            default_confidence=0.05,
+        )
+        self.assertTrue(torch.allclose(mean_conf, torch.tensor([0.7, 0.3], dtype=torch.float32), atol=1e-6))
+        self.assertTrue(torch.allclose(conf_head, torch.tensor([2, 1], dtype=torch.long)))
 
 
 class TestCheckpointRuntimeContract(unittest.TestCase):

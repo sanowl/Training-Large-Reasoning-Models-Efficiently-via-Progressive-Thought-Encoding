@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -54,6 +53,7 @@ class CacheAwareRolloutEngine:
         self.temperature = temperature
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
+        self._evict_offsets_cache: dict[tuple[str, int, int], torch.Tensor] = {}
 
     def _sample(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.temperature == 0:
@@ -80,6 +80,71 @@ class CacheAwareRolloutEngine:
             full = prompt_valid + gen_valid
             outputs.append(self.tokenizer.decode(full, skip_special_tokens=True))
         return outputs
+
+    @staticmethod
+    def _append_token_confidences(
+        *,
+        conf_buffer: torch.Tensor,
+        conf_tail: torch.Tensor,
+        token_prob: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> None:
+        active_idx = torch.nonzero(active_mask, as_tuple=False).squeeze(-1)
+        if active_idx.numel() == 0:
+            return
+        write_pos = conf_tail.index_select(0, active_idx)
+        conf_buffer[active_idx, write_pos] = token_prob.index_select(0, active_idx)
+        conf_tail[active_idx] += 1
+
+    @staticmethod
+    def _pop_evicted_confidence(
+        *,
+        conf_buffer: torch.Tensor,
+        conf_head: torch.Tensor,
+        conf_tail: torch.Tensor,
+        num_evicted: int,
+        default_confidence: float,
+        offsets: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if num_evicted <= 0:
+            raise ValueError(f"num_evicted must be > 0, got {num_evicted}")
+        batch_size = int(conf_buffer.shape[0])
+        device = conf_buffer.device
+        dtype = conf_buffer.dtype
+
+        available = (conf_tail - conf_head).clamp(min=0)  # [B]
+        if offsets is None:
+            offsets = torch.arange(num_evicted, device=device, dtype=torch.long).unsqueeze(0)  # [1, E]
+        elif offsets.ndim != 2 or offsets.shape[1] != num_evicted:
+            raise ValueError(
+                f"offsets must have shape [1, {num_evicted}], got {tuple(offsets.shape)}"
+            )
+        valid = offsets < available.unsqueeze(1)  # [B, E]
+
+        max_index = max(int(conf_buffer.shape[1] - 1), 0)
+        positions = conf_head.unsqueeze(1) + offsets
+        positions = positions.clamp(min=0, max=max_index)
+        selected = conf_buffer.gather(dim=1, index=positions)
+
+        valid_f = valid.to(dtype=dtype)
+        summed = (selected * valid_f).sum(dim=1)
+        counts = valid_f.sum(dim=1)
+        default = torch.scalar_tensor(float(default_confidence), device=device, dtype=dtype)
+        mean_conf = torch.where(counts > 0, summed / counts.clamp_min(1.0), default)
+
+        conf_head += torch.minimum(
+            available,
+            torch.full_like(available, int(num_evicted)),
+        )
+        return mean_conf
+
+    def _eviction_offsets(self, *, device: torch.device, num_evicted: int) -> torch.Tensor:
+        key = (device.type, -1 if device.index is None else int(device.index), int(num_evicted))
+        cached = self._evict_offsets_cache.get(key)
+        if cached is None:
+            cached = torch.arange(num_evicted, device=device, dtype=torch.long).unsqueeze(0)
+            self._evict_offsets_cache[key] = cached
+        return cached
 
     def generate_batch(
         self,
@@ -145,7 +210,13 @@ class CacheAwareRolloutEngine:
 
         num_eviction_events = 0
         num_evicted_tokens = 0
-        token_conf_queues = [deque() for _ in range(batch_size)]
+        token_conf_buffer = torch.zeros(
+            (batch_size, self.max_new_tokens),
+            device=device,
+            dtype=torch.float32,
+        )
+        token_conf_head = torch.zeros(batch_size, device=device, dtype=torch.long)
+        token_conf_tail = torch.zeros(batch_size, device=device, dtype=torch.long)
 
         grad_ctx = nullcontext() if track_grad else torch.inference_mode()
         with grad_ctx:
@@ -165,13 +236,15 @@ class CacheAwareRolloutEngine:
                 generated_mask[:, step] = valid_mask
                 sampled_logprobs[:, step] = token_logp.to(torch.float32) * valid_mask
                 token_prob = torch.exp(token_logp.detach()).clamp(min=0.0, max=1.0)
-                for batch_idx in range(batch_size):
-                    if bool(valid_mask[batch_idx].item()):
-                        token_conf_queues[batch_idx].append(float(token_prob[batch_idx].item()))
+                self._append_token_confidences(
+                    conf_buffer=token_conf_buffer,
+                    conf_tail=token_conf_tail,
+                    token_prob=token_prob,
+                    active_mask=active,
+                )
 
                 if self.eos_token_id is not None:
                     active = active & (next_tokens != self.eos_token_id)
-                if self.eos_token_id is not None:
                     next_tokens = torch.where(
                         active,
                         next_tokens,
@@ -185,22 +258,16 @@ class CacheAwareRolloutEngine:
                     window_size_override=window_override,
                 )
                 if evicted is not None and evicted.num_evicted > 0:
-                    evicted_conf_values: list[float] = []
-                    for batch_idx in range(batch_size):
-                        popped: list[float] = []
-                        for _ in range(evicted.num_evicted):
-                            if token_conf_queues[batch_idx]:
-                                popped.append(token_conf_queues[batch_idx].popleft())
-                            else:
-                                break
-                        if popped:
-                            evicted_conf_values.append(sum(popped) / float(len(popped)))
-                        else:
-                            evicted_conf_values.append(float(self.thought_encoder.config.min_token_confidence))
-                    evicted_token_conf = torch.tensor(
-                        evicted_conf_values,
-                        device=device,
-                        dtype=state.dtype,
+                    evicted_token_conf = self._pop_evicted_confidence(
+                        conf_buffer=token_conf_buffer,
+                        conf_head=token_conf_head,
+                        conf_tail=token_conf_tail,
+                        num_evicted=evicted.num_evicted,
+                        default_confidence=float(self.thought_encoder.config.min_token_confidence),
+                        offsets=self._eviction_offsets(
+                            device=token_conf_buffer.device,
+                            num_evicted=evicted.num_evicted,
+                        ),
                     )
                     state = self.thought_encoder.update_state(
                         state,
@@ -208,7 +275,7 @@ class CacheAwareRolloutEngine:
                         evicted.values.detach(),
                         detach_prev_state=True,
                         evicted_tokens_per_layer=evicted.num_evicted,
-                        evicted_token_confidence=evicted_token_conf,
+                        evicted_token_confidence=evicted_token_conf.to(dtype=state.dtype),
                     )
                     num_eviction_events += 1
                     num_evicted_tokens += evicted.num_evicted
