@@ -1,6 +1,6 @@
 from .cache import EvictedKV, SlidingWindowCache
 from .config import CacheConfig, GRPOConfig, ThoughtConfig, TrainConfig
-from .dynamic_lora import DynamicLoRAConfig, DynamicLoRALinear, attach_dynamic_lora
+from .dynamic_lora import DynamicLoRAConfig, DynamicLoRALinear, attach_dynamic_lora, dynamic_lora_signature
 from .grpo import GRPOMetrics, grpo_objective, normalize_group_rewards, sequence_logprob
 from .rewards import answers_equivalent, exact_match_reward, extract_final_answer, math_equivalence_reward
 from .rollout import CacheAwareRolloutEngine, RolloutBatch
@@ -24,6 +24,7 @@ __all__ = [
     "TrainStepOutput",
     "answers_equivalent",
     "attach_dynamic_lora",
+    "dynamic_lora_signature",
     "exact_match_reward",
     "extract_final_answer",
     "math_equivalence_reward",

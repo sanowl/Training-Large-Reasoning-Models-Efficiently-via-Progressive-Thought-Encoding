@@ -13,9 +13,9 @@ PastKeyValues = tuple[tuple[torch.Tensor, torch.Tensor], ...]
 
 @dataclass(frozen=True)
 class EvictedKV:
-    keys: torch.Tensor  # [B, E, H]
-    values: torch.Tensor  # [B, E, H]
-    num_evicted: int
+    keys: torch.Tensor  # [B, L, E, H]
+    values: torch.Tensor  # [B, L, E, H]
+    num_evicted: int  # evicted tokens per layer (actual cache tokens removed)
 
 
 class SlidingWindowCache:
@@ -48,13 +48,27 @@ class SlidingWindowCache:
             raise ValueError("cannot summarize empty evicted layer list")
         key_list: list[torch.Tensor] = []
         value_list: list[torch.Tensor] = []
+        evicted_per_layer: int | None = None
         for key, value in layers:
             # [B, Heads, E, Dim] -> [B, E, Heads*Dim]
-            key_list.append(key.permute(0, 2, 1, 3).flatten(start_dim=2))
-            value_list.append(value.permute(0, 2, 1, 3).flatten(start_dim=2))
-        keys = torch.stack(key_list, dim=0).mean(dim=0)
-        values = torch.stack(value_list, dim=0).mean(dim=0)
-        num_evicted = int(keys.shape[1])
+            flat_k = key.permute(0, 2, 1, 3).flatten(start_dim=2)
+            flat_v = value.permute(0, 2, 1, 3).flatten(start_dim=2)
+            if evicted_per_layer is None:
+                evicted_per_layer = int(flat_k.shape[1])
+            elif int(flat_k.shape[1]) != evicted_per_layer:
+                raise ValueError(
+                    "inconsistent evicted token count across layers: "
+                    f"expected {evicted_per_layer}, got {int(flat_k.shape[1])}"
+                )
+            key_list.append(flat_k)
+            value_list.append(flat_v)
+
+        # Preserve layer identity explicitly for downstream learned layer attention.
+        keys = torch.stack(key_list, dim=1)  # [B, L, E, H]
+        values = torch.stack(value_list, dim=1)  # [B, L, E, H]
+        if evicted_per_layer is None:
+            raise RuntimeError("failed to infer evicted token count")
+        num_evicted = evicted_per_layer
         return EvictedKV(keys=keys, values=values, num_evicted=num_evicted)
 
     @staticmethod

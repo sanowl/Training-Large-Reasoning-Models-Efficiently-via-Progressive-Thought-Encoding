@@ -17,8 +17,22 @@ class ThoughtConfig:
     hidden_size: int
     rank: int = 32
     num_global_tokens: int = 32
+    use_layer_attention: bool = True
+    layer_attn_temperature: float = 1.0
     normalize_eps: float = 1e-6
     adapter_scale: float = 1.0
+    max_state_norm: float = 4.0
+    state_decay: float = 0.01
+    min_update_gate: float = 0.05
+    max_update_gate: float = 0.30
+    evidence_tokens_scale: float = 8.0
+    track_state_stats: bool = True
+    state_stats_momentum: float = 0.01
+    ood_guard_enabled: bool = True
+    ood_threshold: float = 3.0
+    ood_temperature: float = 0.5
+    ood_min_confidence: float = 0.2
+    apply_ood_guard_in_train: bool = False
 
 
 @dataclass(frozen=True)

@@ -15,12 +15,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run cache-constrained inference with Progressive Thought Encoding.")
     parser.add_argument("--model_name_or_path", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--allow_partial_checkpoint", action="store_true")
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--cache_window", type=int, default=1024)
     parser.add_argument("--evict_ratio", type=float, default=0.25)
     parser.add_argument("--global_tokens", type=int, default=32)
     parser.add_argument("--lora_rank", type=int, default=32)
     parser.add_argument("--lora_alpha", type=float, default=32.0)
+    parser.add_argument("--lora_interaction", type=str, default="outer", choices=["diagonal", "outer"])
+    parser.add_argument("--lora_outer_scale", type=float, default=1.0)
+    parser.add_argument("--disable_ood_guard", action="store_true")
+    parser.add_argument("--ood_threshold", type=float, default=3.0)
+    parser.add_argument("--ood_temperature", type=float, default=0.5)
+    parser.add_argument("--ood_min_confidence", type=float, default=0.2)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     return parser.parse_args()
@@ -46,10 +53,22 @@ def main() -> None:
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=0.0,
+        lora_interaction=args.lora_interaction,
+        lora_outer_scale=args.lora_outer_scale,
         global_tokens=args.global_tokens,
+        track_state_stats=True,
+        ood_guard_enabled=not args.disable_ood_guard,
+        ood_threshold=args.ood_threshold,
+        ood_temperature=args.ood_temperature,
+        ood_min_confidence=args.ood_min_confidence,
         load_reference=False,
     )
-    step = load_pte_checkpoint(setup.model, setup.thought_encoder, args.checkpoint)
+    step = load_pte_checkpoint(
+        setup.model,
+        setup.thought_encoder,
+        args.checkpoint,
+        allow_partial=args.allow_partial_checkpoint,
+    )
     print(f"loaded checkpoint step={step}")
 
     cache = SlidingWindowCache(

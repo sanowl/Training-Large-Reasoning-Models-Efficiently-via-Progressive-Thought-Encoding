@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from dataclasses import dataclass
 from typing import Iterable
 
 import torch
 
 from .config import ThoughtConfig
-from .dynamic_lora import DynamicLoRAConfig, attach_dynamic_lora
+from .dynamic_lora import DynamicLoRAConfig, attach_dynamic_lora, dynamic_lora_signature
 from .thought_state import ProgressiveThoughtEncoder
 
 
@@ -37,6 +38,13 @@ def _infer_kv_hidden_size(config: object) -> int:
     return kv_heads * head_dim
 
 
+def _runtime_contract(model: torch.nn.Module, thought_encoder: ProgressiveThoughtEncoder) -> dict[str, object]:
+    return {
+        "dynamic_lora": dynamic_lora_signature(model),
+        "thought_config": asdict(thought_encoder.config),
+    }
+
+
 def build_hf_setup(
     *,
     model_name_or_path: str,
@@ -45,7 +53,16 @@ def build_hf_setup(
     lora_rank: int = 32,
     lora_alpha: float = 32.0,
     lora_dropout: float = 0.0,
+    lora_interaction: str = "outer",
+    lora_outer_scale: float = 1.0,
     global_tokens: int = 32,
+    track_state_stats: bool = True,
+    state_stats_momentum: float = 0.01,
+    ood_guard_enabled: bool = True,
+    ood_threshold: float = 3.0,
+    ood_temperature: float = 0.5,
+    ood_min_confidence: float = 0.2,
+    apply_ood_guard_in_train: bool = False,
     load_reference: bool = True,
     target_module_suffixes: Iterable[str] = (
         "q_proj",
@@ -84,6 +101,13 @@ def build_hf_setup(
             hidden_size=kv_hidden_size,
             rank=lora_rank,
             num_global_tokens=global_tokens,
+            track_state_stats=track_state_stats,
+            state_stats_momentum=state_stats_momentum,
+            ood_guard_enabled=ood_guard_enabled,
+            ood_threshold=ood_threshold,
+            ood_temperature=ood_temperature,
+            ood_min_confidence=ood_min_confidence,
+            apply_ood_guard_in_train=apply_ood_guard_in_train,
         )
     ).to(device=device, dtype=dtype)
 
@@ -91,6 +115,8 @@ def build_hf_setup(
         rank=lora_rank,
         alpha=lora_alpha,
         dropout=lora_dropout,
+        interaction_mode=lora_interaction,
+        outer_scale=lora_outer_scale,
         freeze_base=True,
     )
     replaced = attach_dynamic_lora(
@@ -126,12 +152,32 @@ def load_pte_checkpoint(
     if not allow_partial:
         model_missing = list(model_incompat.missing_keys)
         model_unexpected = list(model_incompat.unexpected_keys)
-        thought_missing = list(thought_incompat.missing_keys)
-        thought_unexpected = list(thought_incompat.unexpected_keys)
+        optional_thought_keys = {"state_mean", "state_var", "state_stats_initialized"}
+        thought_missing = [k for k in thought_incompat.missing_keys if k not in optional_thought_keys]
+        thought_unexpected = [k for k in thought_incompat.unexpected_keys if k not in optional_thought_keys]
         if model_missing or model_unexpected or thought_missing or thought_unexpected:
             raise RuntimeError(
                 "checkpoint mismatch detected: "
                 f"model_missing={len(model_missing)}, model_unexpected={len(model_unexpected)}, "
                 f"thought_missing={len(thought_missing)}, thought_unexpected={len(thought_unexpected)}"
+            )
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            raise RuntimeError(
+                "checkpoint missing metadata runtime contract; "
+                "retrain with current code or load with allow_partial=True"
+            )
+        runtime_saved = metadata.get("runtime_contract")
+        if not isinstance(runtime_saved, dict):
+            raise RuntimeError(
+                "checkpoint metadata missing runtime_contract; "
+                "retrain with current code or load with allow_partial=True"
+            )
+        runtime_expected = _runtime_contract(model, thought_encoder)
+        if runtime_saved != runtime_expected:
+            raise RuntimeError(
+                "checkpoint runtime contract mismatch: "
+                f"saved={runtime_saved} expected={runtime_expected}. "
+                "Use matching CLI/config or load with allow_partial=True."
             )
     return int(payload.get("step", 0))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import asdict
 from dataclasses import dataclass
 from pathlib import Path
 import random
@@ -10,6 +11,7 @@ import torch
 from torch import nn
 
 from .config import GRPOConfig, TrainConfig
+from .dynamic_lora import dynamic_lora_signature
 from .grpo import GRPOMetrics, grpo_objective, normalize_group_rewards, sequence_logprob
 from .rollout import CacheAwareRolloutEngine, RolloutBatch
 from .thought_state import ProgressiveThoughtEncoder
@@ -312,11 +314,19 @@ class ProgressiveThoughtTrainer:
             model_to_save = model_to_save.module
         if hasattr(model_to_save, "_orig_mod"):
             model_to_save = model_to_save._orig_mod
+        runtime_contract = {
+            "dynamic_lora": dynamic_lora_signature(model_to_save),
+            "thought_config": asdict(self.thought_encoder.config),
+        }
         payload = {
             "model": model_to_save.state_dict(),
             "thought_encoder": self.thought_encoder.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scaler": self._scaler.state_dict() if self._scaler is not None else None,
             "step": self._step,
+            "metadata": {
+                "format_version": 2,
+                "runtime_contract": runtime_contract,
+            },
         }
         torch.save(payload, Path(path))

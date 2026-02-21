@@ -184,6 +184,7 @@ class CacheAwareRolloutEngine:
                         evicted.keys.detach(),
                         evicted.values.detach(),
                         detach_prev_state=True,
+                        evicted_tokens_per_layer=evicted.num_evicted,
                     )
                     num_eviction_events += 1
                     num_evicted_tokens += evicted.num_evicted

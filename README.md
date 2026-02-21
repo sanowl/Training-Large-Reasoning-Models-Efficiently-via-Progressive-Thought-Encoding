@@ -17,7 +17,10 @@ The method preserves long-range reasoning signals by converting evicted KV-cache
 5. GRPO training with grouped reward normalization and KL regularization.
 6. Distributed training (DDP), AMP policy control, optional `torch.compile`, and profiler export.
 7. Throughput controls for long rollouts (dynamic cache windowing, rollout/ref sub-batching, fused AdamW).
-8. Training and inference CLI entry points with unit tests for critical core components.
+8. OOD safety guard that attenuates dynamic adaptation when thought-state statistics drift out of training distribution.
+9. Layer-aware eviction aggregation in the thought encoder (learned attention over layer summaries).
+10. Runtime-contract checkpoint validation to prevent silent config/behavior mismatches.
+11. Training and inference CLI entry points with unit tests for critical core components.
 
 ## Repository Structure
 
@@ -86,6 +89,9 @@ python3 scripts/train_grpo_pte.py \
   --cache_window 1024 \
   --evict_ratio 0.25 \
   --reward_mode math \
+  --lora_interaction outer \
+  --ood_threshold 3.0 \
+  --ood_min_confidence 0.2 \
   --global_tokens 32 \
   --lora_rank 32 \
   --lora_alpha 32 \
@@ -134,6 +140,8 @@ python3 scripts/run_inference.py \
   --evict_ratio 0.25
 ```
 
+If loading an older checkpoint without runtime metadata, add `--allow_partial_checkpoint`.
+
 ## Method Mapping to Paper
 
 1. **Cache-aware policy** (`π^D`) is implemented via constrained rollout and online cache pruning.
@@ -149,7 +157,7 @@ python3 scripts/run_inference.py \
 3. Inference skips loading a reference model to reduce memory footprint.
 4. Rollout and reference-model passes support sub-batching to manage long-sequence memory pressure.
 5. Checkpoints unwrap DDP/compiled wrappers before serialization for load compatibility.
-6. Checkpoint loading is strict by default to catch architecture mismatches early.
+6. Checkpoint runtime contract is validated by default (LoRA/thought config); `allow_partial` bypass is available.
 
 ## Limitations
 

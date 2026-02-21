@@ -16,13 +16,17 @@ class DynamicLoRAConfig:
     rank: int = 32
     alpha: float = 32.0
     dropout: float = 0.0
+    interaction_mode: str = "outer"  # "diagonal" or "outer"
+    outer_scale: float = 1.0
     freeze_base: bool = True
 
 
 class DynamicLoRALinear(nn.Module):
     """
-    y = xW + x(B^T) * S_e -> A^T
-    Equivalent to low-rank update with dynamic middle state S_e from evicted context.
+    y = xW + DynamicLoRA(x, S_e)
+    Supports:
+      - diagonal: x B^T diag(S_e) A^T
+      - outer:    x B^T (diag(S_e) + outer_scale * S_e S_e^T) A^T
     """
 
     def __init__(
@@ -35,11 +39,19 @@ class DynamicLoRALinear(nn.Module):
         super().__init__()
         if config.rank <= 0:
             raise ValueError(f"rank must be > 0, got {config.rank}")
+        if config.interaction_mode not in ("diagonal", "outer"):
+            raise ValueError(
+                f"interaction_mode must be one of ('diagonal', 'outer'), got {config.interaction_mode}"
+            )
+        if config.outer_scale < 0:
+            raise ValueError(f"outer_scale must be >= 0, got {config.outer_scale}")
         self.base = base_layer
         self.thought_encoder = thought_encoder
         self.rank = config.rank
         self.alpha = config.alpha
         self.scaling = config.alpha / config.rank
+        self.interaction_mode = config.interaction_mode
+        self.outer_scale = config.outer_scale
         self.dropout = nn.Dropout(config.dropout) if config.dropout > 0.0 else nn.Identity()
 
         in_features = base_layer.in_features
@@ -74,23 +86,33 @@ class DynamicLoRALinear(nn.Module):
         base_out = self.base(x)
         lora_in = F.linear(self.dropout(x), self.lora_b)  # [..., R]
         state = self.thought_encoder.runtime_state()  # [B, R]
+        confidence = self.thought_encoder.adaptation_confidence(state)  # [B, 1]
 
         if x.ndim == 2:
             if state.shape[0] != x.shape[0]:
                 raise RuntimeError(
                     f"state batch {state.shape[0]} does not match input batch {x.shape[0]}"
                 )
-            scaled = lora_in * state
+            state_view = state
+            confidence_view = confidence
         elif x.ndim == 3:
             if state.shape[0] != x.shape[0]:
                 raise RuntimeError(
                     f"state batch {state.shape[0]} does not match input batch {x.shape[0]}"
                 )
-            scaled = lora_in * state.unsqueeze(1)
+            state_view = state.unsqueeze(1)
+            confidence_view = confidence.unsqueeze(1)
         else:
             raise ValueError(f"unsupported input shape for DynamicLoRALinear: {tuple(x.shape)}")
 
+        scaled = lora_in * state_view
+        if self.interaction_mode == "outer" and self.outer_scale > 0.0:
+            # Cross-rank interaction: z @ (s s^T) = (z · s) s
+            proj = (lora_in * state_view).sum(dim=-1, keepdim=True)
+            scaled = scaled + (self.outer_scale * proj * state_view)
+
         delta = F.linear(scaled, self.lora_a)
+        delta = delta * confidence_view
         return base_out + (self.scaling * delta)
 
 
@@ -145,3 +167,23 @@ def dynamic_lora_parameters(model: nn.Module) -> list[nn.Parameter]:
         if isinstance(module, DynamicLoRALinear):
             params.extend([module.lora_a, module.lora_b])
     return params
+
+
+def dynamic_lora_signature(model: nn.Module) -> dict[str, object] | None:
+    modules = [m for m in model.modules() if isinstance(m, DynamicLoRALinear)]
+    if not modules:
+        return None
+
+    def compact(values: list[object]) -> object:
+        unique = sorted(set(values))
+        if len(unique) == 1:
+            return unique[0]
+        return unique
+
+    return {
+        "num_modules": len(modules),
+        "rank": compact([int(m.rank) for m in modules]),
+        "alpha": compact([float(m.alpha) for m in modules]),
+        "interaction_mode": compact([str(m.interaction_mode) for m in modules]),
+        "outer_scale": compact([float(m.outer_scale) for m in modules]),
+    }
